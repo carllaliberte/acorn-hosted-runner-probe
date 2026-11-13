@@ -138,6 +138,8 @@ jobs:
             }finally{await context.close();}
           }finally{await browser.close();}
           CHROMIUM_JS
+          # umask 077 protects host files; the non-root container must read this synthetic script.
+          chmod 0644 "$work/context/probe.mjs"
           timeout --signal=TERM --kill-after=5s 180s docker build --pull \
             -t "$image" "$work/context"
           timeout --signal=TERM --kill-after=5s 70s docker run --pull=never --rm --init \
