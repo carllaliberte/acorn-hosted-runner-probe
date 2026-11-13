@@ -109,7 +109,7 @@ jobs:
           WORKDIR /probe
           RUN printf '{"name":"synthetic-chromium-host-witness","private":true,"type":"module"}\n' > package.json && \
               npm install --omit=dev --ignore-scripts --no-audit --no-fund --package-lock=false playwright-core@1.65.0
-          COPY probe.mjs /probe/probe.mjs
+          COPY --chmod=0644 probe.mjs /probe/probe.mjs
           COPY namespace-witness /probe/namespace-witness
           RUN groupadd --gid 10001 witness && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin witness
           USER 10001:10001
@@ -164,8 +164,10 @@ jobs:
             }finally{await context.close();}
           }finally{await browser.close();}
           CHROMIUM_JS
-          # umask 077 protects host files; the non-root container must read this synthetic script.
-          chmod 0644 "$work/context/probe.mjs"
+          # Prove strict host umask and fix only image permissions via Docker COPY --chmod.
+          source_mode="$(stat -c '%a' "$work/context/probe.mjs")"
+          echo "SYNTHETIC_HOST_SCRIPT_MODE=$source_mode"
+          [[ "$source_mode" == "600" ]] || { echo "HOST_MODE_NOT_PRIVATE"; exit 2; }
           # Synthetic syscall diagnostic; it never changes host settings or grants capabilities.
           cat > "$work/namespace-witness.c" <<'ACORN_NAMESPACE_WITNESS'
           #define _GNU_SOURCE
