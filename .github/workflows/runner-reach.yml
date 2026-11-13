@@ -110,9 +110,11 @@ jobs:
           RUN printf '{"name":"synthetic-chromium-host-witness","private":true,"type":"module"}\n' > package.json && \
               npm install --omit=dev --ignore-scripts --no-audit --no-fund --package-lock=false playwright-core@1.65.0
           COPY --chmod=0644 probe.mjs /probe/probe.mjs
+          COPY --chmod=0644 nested/a.js nested/b.js ./nested/
           COPY namespace-witness /probe/namespace-witness
           RUN groupadd --gid 10001 witness && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin witness
           USER 10001:10001
+          RUN node --check /probe/nested/a.js && node --check /probe/nested/b.js && echo SYNTHETIC_MULTI_COPY_UID10001_PASS
           ENV NODE_ENV=production HOME=/tmp
           CMD ["node","/probe/probe.mjs"]
           CHROMIUM_DOCKERFILE
@@ -164,6 +166,13 @@ jobs:
             }finally{await context.close();}
           }finally{await browser.close();}
           CHROMIUM_JS
+          # Simulate the ACORN allowlist: a private 0700 source directory with 0600 JS files.
+          mkdir -m 0700 "$work/context/nested"
+          printf 'export const a=1;\n' > "$work/context/nested/a.js"
+          printf 'export const b=2;\n' > "$work/context/nested/b.js"
+          [[ "$(stat -c '%a' "$work/context/nested")" == "700" ]]
+          [[ "$(stat -c '%a' "$work/context/nested/a.js")" == "600" ]]
+          [[ "$(stat -c '%a' "$work/context/nested/b.js")" == "600" ]]
           # Prove strict host umask and fix only image permissions via Docker COPY --chmod.
           source_mode="$(stat -c '%a' "$work/context/probe.mjs")"
           echo "SYNTHETIC_HOST_SCRIPT_MODE=$source_mode"
