@@ -11,7 +11,7 @@ permissions:
 jobs:
   probe:
     name: RUNNER_REACHED + offline UID witness
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
       - name: RUNNER_REACHED
@@ -142,11 +142,18 @@ jobs:
           chmod 0644 "$work/context/probe.mjs"
           timeout --signal=TERM --kill-after=5s 180s docker build --pull \
             -t "$image" "$work/context"
+          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 35 \
+            --output "$work/seccomp_profile.json" \
+            https://raw.githubusercontent.com/microsoft/playwright/v1.65.0/utils/docker/seccomp_profile.json
+          # Official Playwright v1.65.0 seccomp profile; verify Git blob before trusting.
+          [[ "$(git hash-object "$work/seccomp_profile.json")" == "fddc05fb520affb145404e6f6f647ca96af8087d" ]] || { echo "SECCOMP_PROFILE_UNVERIFIED"; exit 2; }
+          python3 -m json.tool "$work/seccomp_profile.json" > /dev/null
+          echo "SECCOMP_PLAYWRIGHT_PROFILE_VERIFIED"
           timeout --signal=TERM --kill-after=5s 70s docker run --pull=never --rm --init \
             --cidfile "$work/container.cid" \
             --network none --user 10001:10001 --read-only --cap-drop ALL \
             --cgroupns private --security-opt no-new-privileges=true \
-            --security-opt seccomp=builtin --pids-limit 64 --memory 1g \
+            --security-opt "seccomp=$work/seccomp_profile.json" --pids-limit 64 --memory 1g \
             --memory-swap 1g --cpus 1 --shm-size 256m --ipc private \
             --tmpfs /tmp:rw,nosuid,nodev,size=512m,mode=1777 \
             --tmpfs /run/acorn-browser/private:rw,nosuid,nodev,noexec,size=64m,mode=0700,uid=10001,gid=10001 \
