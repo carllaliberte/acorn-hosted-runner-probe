@@ -1,0 +1,47 @@
+name: Public synthetic Playwright lockfile witness
+
+on:
+  push:
+    branches: [probe/acorn-browser-lockfile-20261113]
+
+permissions:
+  contents: read
+
+jobs:
+  lock:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Generate and independently verify public npm dependency lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$(mktemp -d)"
+          trap 'rm -rf -- "$work"' EXIT
+          cd "$work"
+          cat > package.json <<'PUBLIC_PACKAGE'
+          {
+            "name": "acorn-public-synthetic-lock-witness",
+            "private": true,
+            "version": "0.0.1",
+            "type": "module",
+            "engines": {"node": ">=22"},
+            "dependencies": {"playwright-core": "1.65.0"}
+          }
+          PUBLIC_PACKAGE
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          test -f package-lock.json
+          node -e 'const p=require("./package-lock.json"); if(p.lockfileVersion!==3||p.packages["node_modules/playwright-core"].version!=="1.65.0"||!p.packages["node_modules/playwright-core"].integrity) process.exit(2);'
+          npm ci --ignore-scripts --no-audit --no-fund
+          test "$(node -p 'require("./node_modules/playwright-core/package.json").version')" = "1.65.0"
+          echo "PUBLIC_NPM_CI_VERIFIED"
+          node -e 'const p=require("./package-lock.json"); console.log("LOCKFILE_JSON="+JSON.stringify(p))'
+          {
+            echo "## Public synthetic npm lock witness"
+            echo "- npm_ci: PASS"
+            echo "- version: playwright-core 1.65.0"
+            echo "- exact_source: public_npm_registry"
+            echo "- private_acorn_code: never_used"
+            echo "- authorized_for_production: false"
+          } >> "$GITHUB_STEP_SUMMARY"
