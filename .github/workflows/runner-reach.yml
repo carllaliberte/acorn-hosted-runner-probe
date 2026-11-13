@@ -177,11 +177,29 @@ jobs:
           [[ "$(git hash-object "$work/seccomp_profile.json")" == "fddc05fb520affb145404e6f6f647ca96af8087d" ]] || { echo "SECCOMP_PROFILE_UNVERIFIED"; exit 2; }
           python3 -m json.tool "$work/seccomp_profile.json" > /dev/null
           echo "SECCOMP_PLAYWRIGHT_PROFILE_VERIFIED"
+          # EXPERIMENTAL_DIAGNOSTIC_ONLY: narrow seccomp syscall change, NOT production approval.
+          # chroot still requires kernel CAP_SYS_CHROOT; parent container has CapEff=0.
+          python3 - "$work/seccomp_profile.json" "$work/experimental-chroot.json" <<'ACORN_SECCOMP_EXPERIMENT'
+          import json,sys
+          source,destination=sys.argv[1:]
+          with open(source,encoding='utf-8') as handle: profile=json.load(handle)
+          assert profile['defaultAction']=='SCMP_ACT_ERRNO'
+          rules=[item for item in profile['syscalls'] if 'chroot' in item.get('names',[])]
+          assert len(rules)==1
+          assert rules[0]['names']==['chroot']
+          assert rules[0]['action']=='SCMP_ACT_ALLOW'
+          assert rules[0].get('includes')=={'caps':['CAP_SYS_CHROOT']}
+          assert rules[0].get('excludes')=={}
+          rules[0]['includes']={}
+          with open(destination,'w',encoding='utf-8') as handle: json.dump(profile,handle,sort_keys=True)
+          print('EXPERIMENTAL_CHROOT_RULE_ONLY; cap-drop ALL preserved; no production authorization')
+          ACORN_SECCOMP_EXPERIMENT
+          chmod 0600 "$work/experimental-chroot.json"
           # Match Chromium's sandbox exactly, without disabling seccomp or adding caps.
           timeout --signal=TERM --kill-after=5s 25s docker run --pull=never --rm --init \
             --network none --user 10001:10001 --read-only --cap-drop ALL \
             --cgroupns private --security-opt no-new-privileges=true \
-            --security-opt "seccomp=$work/seccomp_profile.json" --pids-limit 64 --memory 1g \
+            --security-opt "seccomp=$work/experimental-chroot.json" --pids-limit 64 --memory 1g \
             --memory-swap 1g --cpus 1 --shm-size 256m --ipc private \
             --tmpfs /tmp:rw,nosuid,nodev,size=512m,mode=1777 \
             --entrypoint /probe/namespace-witness "$image"
@@ -190,7 +208,7 @@ jobs:
             --cidfile "$work/container.cid" \
             --network none --user 10001:10001 --read-only --cap-drop ALL \
             --cgroupns private --security-opt no-new-privileges=true \
-            --security-opt "seccomp=$work/seccomp_profile.json" --pids-limit 64 --memory 1g \
+            --security-opt "seccomp=$work/experimental-chroot.json" --pids-limit 64 --memory 1g \
             --memory-swap 1g --cpus 1 --shm-size 256m --ipc private \
             --tmpfs /tmp:rw,nosuid,nodev,size=512m,mode=1777 \
             --tmpfs /run/acorn-browser/private:rw,nosuid,nodev,noexec,size=64m,mode=0700,uid=10001,gid=10001 \
