@@ -2,7 +2,7 @@ name: Public hosted runner probe
 
 on:
   push:
-    branches: [main]
+    branches: [main, probe/acorn-browser-uid-20261113]
   workflow_dispatch:
 
 permissions:
@@ -10,15 +10,78 @@ permissions:
 
 jobs:
   probe:
-    name: RUNNER_REACHED public probe
-    runs-on: ubuntu-latest
+    name: RUNNER_REACHED + offline UID witness
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: RUNNER_REACHED
+        shell: bash
         run: |
+          set -euo pipefail
           echo "RUNNER_REACHED=true"
           echo "runner_os=${RUNNER_OS}"
           echo "runner_arch=${RUNNER_ARCH}"
           echo "github_sha=${GITHUB_SHA}"
           echo "github_run_id=${GITHUB_RUN_ID}"
-          uname -a || true
+          uname -a
+
+      - name: Verify local Docker isolation prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v docker
+          command -v cc
+          command -v timeout
+          test "$(docker context show)" = default || { echo "DOCKER_CONTEXT_NOT_DEFAULT"; exit 2; }
+          endpoint="$(docker context inspect default --format '{{ .Endpoints.docker.Host }}')"
+          [[ "$endpoint" == unix:///* ]] || { echo "DOCKER_ENDPOINT_NOT_LOCAL"; exit 2; }
+          limits="$(docker info --format '{{.MemoryLimit}} {{.PidsLimit}} {{.CgroupVersion}}')"
+          echo "DOCKER_LIMITS=$limits"
+          [[ "$limits" == "true true 2" ]] || { echo "DOCKER_CGROUP_QUOTAS_UNAVAILABLE"; exit 2; }
+
+      - name: Run generated scratch UID witness, offline and without source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$(mktemp -d)"
+          image="acorn-synthetic-uid-$$:local"
+          cleanup() {
+            docker image rm -f "$image" >/dev/null 2>&1 || true
+            rm -rf "$work"
+          }
+          trap cleanup EXIT
+          mkdir -m 0700 "$work/context"
+          cat > "$work/uid.c" <<'ACORN_UID_WITNESS'
+          #include <stdio.h>
+          #include <unistd.h>
+          int main(void) {
+            if (printf("%lu:%lu:%lu:%lu\n",
+                (unsigned long)getuid(), (unsigned long)getgid(),
+                (unsigned long)geteuid(), (unsigned long)getegid()) < 0) return 3;
+            return fflush(stdout) == 0 ? 0 : 4;
+          }
+          ACORN_UID_WITNESS
+          cc -static -O2 -Wall -Wextra -Werror -o "$work/context/uid-proof" "$work/uid.c"
+          chmod 0555 "$work/context/uid-proof"
+          printf 'FROM scratch\nCOPY uid-proof /uid-proof\nUSER 10001:10001\nENTRYPOINT ["/uid-proof"]\n' > "$work/context/Dockerfile"
+          timeout --signal=TERM --kill-after=5s 45s docker build --pull=false -t "$image" "$work/context"
+          ids="$(timeout --signal=TERM --kill-after=5s 30s docker run --pull=never --rm \
+            --network none --user 10001:10001 --read-only --cap-drop ALL \
+            --cgroupns private --security-opt no-new-privileges=true \
+            --security-opt seccomp=builtin --pids-limit 64 --memory 1g \
+            --memory-swap 1g --cpus 1 "$image")"
+          echo "SYNTHETIC_UID_IDS=$ids"
+          [[ "$ids" == "10001:10001:10001:10001" ]] || { echo "SYNTHETIC_UID_WITNESS_HOLD"; exit 2; }
+          echo "SYNTHETIC_UID_WITNESS_PASS"
+          {
+            echo "## ACORN diagnostic — public hosted runner"
+            echo "- run_sha: ${GITHUB_SHA}"
+            echo "- synthetic_uid_witness: PASS"
+            echo "- chromium_started: false"
+            echo "- private_source_transmitted: false"
+            echo "- network_mode: none (probe container)"
+            echo "- cortex_bound_verified: false"
+            echo "- production_ready: false"
+            echo "- live_verified: false"
+          } >> "$GITHUB_STEP_SUMMARY"
