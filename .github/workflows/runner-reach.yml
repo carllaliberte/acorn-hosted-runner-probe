@@ -110,6 +110,7 @@ jobs:
           RUN printf '{"name":"synthetic-chromium-host-witness","private":true,"type":"module"}\n' > package.json && \
               npm install --omit=dev --ignore-scripts --no-audit --no-fund --package-lock=false playwright-core@1.65.0
           COPY probe.mjs /probe/probe.mjs
+          COPY namespace-witness /probe/namespace-witness
           RUN groupadd --gid 10001 witness && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin witness
           USER 10001:10001
           ENV NODE_ENV=production HOME=/tmp
@@ -140,6 +141,33 @@ jobs:
           CHROMIUM_JS
           # umask 077 protects host files; the non-root container must read this synthetic script.
           chmod 0644 "$work/context/probe.mjs"
+          # Synthetic syscall diagnostic; it never changes host settings or grants capabilities.
+          cat > "$work/namespace-witness.c" <<'ACORN_NAMESPACE_WITNESS'
+          #define _GNU_SOURCE
+          #include <sched.h>
+          #include <unistd.h>
+          #include <errno.h>
+          #include <stdio.h>
+          #include <string.h>
+          int main(void) {
+            printf("SYSCALL_START_UID=%lu GID=%lu\n",
+              (unsigned long)getuid(), (unsigned long)getgid());
+            errno=0;
+            int r=unshare(CLONE_NEWUSER);
+            int e=(r==0?0:errno);
+            printf("SYSCALL_USERNS_RC=%d ERRNO=%d NAME=%s\n",r,e,strerror(e));
+            if (r!=0) { fflush(stdout); return 0; }
+            errno=0;
+            int cr=chroot("/proc/self/fdinfo/");
+            int ce=(cr==0?0:errno);
+            printf("SYSCALL_CHROOT_RC=%d ERRNO=%d NAME=%s\n",cr,ce,strerror(ce));
+            fflush(stdout);
+            return 0;
+          }
+          ACORN_NAMESPACE_WITNESS
+          cc -static -O2 -Wall -Wextra -Werror -o "$work/context/namespace-witness" "$work/namespace-witness.c"
+          chmod 0555 "$work/context/namespace-witness"
+          rm -f -- "$work/namespace-witness.c"
           timeout --signal=TERM --kill-after=5s 180s docker build --pull \
             -t "$image" "$work/context"
           curl --fail --silent --show-error --location --connect-timeout 10 --max-time 35 \
@@ -149,6 +177,15 @@ jobs:
           [[ "$(git hash-object "$work/seccomp_profile.json")" == "fddc05fb520affb145404e6f6f647ca96af8087d" ]] || { echo "SECCOMP_PROFILE_UNVERIFIED"; exit 2; }
           python3 -m json.tool "$work/seccomp_profile.json" > /dev/null
           echo "SECCOMP_PLAYWRIGHT_PROFILE_VERIFIED"
+          # Match Chromium's sandbox exactly, without disabling seccomp or adding caps.
+          timeout --signal=TERM --kill-after=5s 25s docker run --pull=never --rm --init \
+            --network none --user 10001:10001 --read-only --cap-drop ALL \
+            --cgroupns private --security-opt no-new-privileges=true \
+            --security-opt "seccomp=$work/seccomp_profile.json" --pids-limit 64 --memory 1g \
+            --memory-swap 1g --cpus 1 --shm-size 256m --ipc private \
+            --tmpfs /tmp:rw,nosuid,nodev,size=512m,mode=1777 \
+            --entrypoint /probe/namespace-witness "$image"
+          echo "SYSCALL_DIAGNOSTIC_RECORDED_NO_PRIVILEGE_CHANGES"
           timeout --signal=TERM --kill-after=5s 70s docker run --pull=never --rm --init \
             --cidfile "$work/container.cid" \
             --network none --user 10001:10001 --read-only --cap-drop ALL \
