@@ -12,7 +12,7 @@ jobs:
   probe:
     name: RUNNER_REACHED + offline UID witness
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: RUNNER_REACHED
         shell: bash
@@ -81,6 +81,80 @@ jobs:
             echo "- chromium_started: false"
             echo "- private_source_transmitted: false"
             echo "- network_mode: none (probe container)"
+            echo "- cortex_bound_verified: false"
+            echo "- production_ready: false"
+            echo "- live_verified: false"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Synthetic offline Chromium sandbox witness, no ACORN private code
+        if: github.ref == 'refs/heads/probe/acorn-browser-uid-20261113'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$(mktemp -d)"
+          image="acorn-synthetic-chromium-${GITHUB_RUN_ID}:local"
+          cleanup() {
+            if [[ -f "$work/container.cid" ]]; then
+              cid="$(cat "$work/container.cid" 2>/dev/null || true)"
+              if [[ "$cid" =~ ^[a-f0-9]{12,64}$ ]]; then docker rm -f "$cid" >/dev/null 2>&1 || true; fi
+            fi
+            docker image rm -f "$image" >/dev/null 2>&1 || true
+            rm -rf "$work"
+          }
+          trap cleanup EXIT
+          mkdir -m 0700 "$work/context"
+          cat > "$work/context/Dockerfile" <<'CHROMIUM_DOCKERFILE'
+          FROM mcr.microsoft.com/playwright:v1.65.0-noble
+          WORKDIR /probe
+          RUN printf '{"name":"synthetic-chromium-host-witness","private":true,"type":"module"}\n' > package.json && \
+              npm install --omit=dev --ignore-scripts --no-audit --no-fund --package-lock=false playwright-core@1.65.0
+          COPY probe.mjs /probe/probe.mjs
+          RUN groupadd --gid 10001 witness && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin witness
+          USER 10001:10001
+          ENV NODE_ENV=production HOME=/tmp
+          CMD ["node","/probe/probe.mjs"]
+          CHROMIUM_DOCKERFILE
+          cat > "$work/context/probe.mjs" <<'CHROMIUM_JS'
+          import {chromium} from 'playwright-core';
+          import {readFileSync} from 'node:fs';
+          const uid=process.getuid?.(), gid=process.getgid?.();
+          const status=readFileSync('/proc/self/status','utf8');
+          const val=k=>status.match(new RegExp('^'+k+':\\s*([^\\n]+)','m'))?.[1]?.trim();
+          if(uid!==10001||gid!==10001)throw Error('NON_ROOT_IDENTITY_HOLD');
+          if(val('CapEff')!=='0000000000000000'||val('NoNewPrivs')!=='1'||val('Seccomp')!=='2')
+            throw Error('LOCAL_GUARDS_HOLD');
+          const browser=await chromium.launch({headless:true,chromiumSandbox:true,timeout:15000});
+          try{
+            const context=await browser.newContext({serviceWorkers:'block',acceptDownloads:false,ignoreHTTPSErrors:false});
+            try{
+              if(typeof context.routeWebSocket!=='function')throw Error('NO_WEBSOCKET_BLOCK');
+              await context.route('**/*', async route=>route.abort());
+              await context.routeWebSocket('**/*', async ws=>ws.close());
+              const page=await context.newPage();
+              await page.goto('about:blank',{timeout:5000});
+              if(page.url()!=='about:blank')throw Error('INCONSISTENT_PAGE');
+              console.log('SYNTHETIC_CHROMIUM_SANDBOX_PASS');
+            }finally{await context.close();}
+          }finally{await browser.close();}
+          CHROMIUM_JS
+          timeout --signal=TERM --kill-after=5s 180s docker build --pull \
+            -t "$image" "$work/context"
+          timeout --signal=TERM --kill-after=5s 70s docker run --pull=never --rm --init \
+            --cidfile "$work/container.cid" \
+            --network none --user 10001:10001 --read-only --cap-drop ALL \
+            --cgroupns private --security-opt no-new-privileges=true \
+            --security-opt seccomp=builtin --pids-limit 64 --memory 1g \
+            --memory-swap 1g --cpus 1 --shm-size 256m --ipc private \
+            --tmpfs /tmp:rw,nosuid,nodev,size=512m,mode=1777 \
+            --tmpfs /run/acorn-browser/private:rw,nosuid,nodev,noexec,size=64m,mode=0700,uid=10001,gid=10001 \
+            "$image"
+          {
+            echo "## ACORN public runner — synthetic Chromium (not canonical)"
+            echo "- run_sha: ${GITHUB_SHA}"
+            echo "- synthetic_chromium_sandbox: PASS"
+            echo "- private_acorn_source_included: false"
+            echo "- google_login: false"
             echo "- cortex_bound_verified: false"
             echo "- production_ready: false"
             echo "- live_verified: false"
