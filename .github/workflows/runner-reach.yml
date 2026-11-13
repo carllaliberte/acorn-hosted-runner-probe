@@ -125,14 +125,39 @@ jobs:
           if(uid!==10001||gid!==10001)throw Error('NON_ROOT_IDENTITY_HOLD');
           if(val('CapEff')!=='0000000000000000'||val('NoNewPrivs')!=='1'||val('Seccomp')!=='2')
             throw Error('LOCAL_GUARDS_HOLD');
+          // Read-only cgroup observations; do not raise quotas or remove sandbox guards.
+          const snapshot=(label)=>{
+            const paths={
+              pids_current:'/sys/fs/cgroup/pids.current',
+              pids_max:'/sys/fs/cgroup/pids.max',
+              pids_events:'/sys/fs/cgroup/pids.events',
+              memory_current:'/sys/fs/cgroup/memory.current',
+              memory_events:'/sys/fs/cgroup/memory.events'
+            };
+            const stats={};
+            for(const [name,path] of Object.entries(paths)){
+              try{stats[name]=readFileSync(path,'utf8').trim()}catch{stats[name]='UNAVAILABLE'}
+            }
+            console.log(label+' '+JSON.stringify(stats));
+          };
+          snapshot('CHROMIUM_CGROUP_BEFORE_LAUNCH');
           const browser=await chromium.launch({headless:true,chromiumSandbox:true,timeout:15000});
+          snapshot('CHROMIUM_CGROUP_AFTER_LAUNCH');
           try{
             const context=await browser.newContext({serviceWorkers:'block',acceptDownloads:false,ignoreHTTPSErrors:false});
             try{
               if(typeof context.routeWebSocket!=='function')throw Error('NO_WEBSOCKET_BLOCK');
               await context.route('**/*', async route=>route.abort());
               await context.routeWebSocket('**/*', async ws=>ws.close());
-              const page=await context.newPage();
+              snapshot('CHROMIUM_CGROUP_BEFORE_PAGE');
+              let page;
+              try{page=await context.newPage();}
+              catch(error){
+                snapshot('CHROMIUM_CGROUP_PAGE_FAILED');
+                console.error('CHROMIUM_PAGE_ERROR='+String(error?.message??error).slice(0,700));
+                throw error;
+              }
+              snapshot('CHROMIUM_CGROUP_AFTER_PAGE');
               await page.goto('about:blank',{timeout:5000});
               if(page.url()!=='about:blank')throw Error('INCONSISTENT_PAGE');
               console.log('SYNTHETIC_CHROMIUM_SANDBOX_PASS');
