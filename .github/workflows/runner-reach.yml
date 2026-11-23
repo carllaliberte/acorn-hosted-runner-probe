@@ -2,7 +2,7 @@ name: Public hosted runner probe
 
 on:
   push:
-    branches: [main]
+    branches: [main, probe/acorn-browser-uid-20261113]
   workflow_dispatch:
 
 permissions:
@@ -10,15 +10,252 @@ permissions:
 
 jobs:
   probe:
-    name: RUNNER_REACHED public probe
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    name: RUNNER_REACHED + offline UID witness
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
       - name: RUNNER_REACHED
+        shell: bash
         run: |
+          set -euo pipefail
           echo "RUNNER_REACHED=true"
           echo "runner_os=${RUNNER_OS}"
           echo "runner_arch=${RUNNER_ARCH}"
           echo "github_sha=${GITHUB_SHA}"
           echo "github_run_id=${GITHUB_RUN_ID}"
-          uname -a || true
+          uname -a
+
+      - name: Verify local Docker isolation prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v docker
+          command -v cc
+          command -v timeout
+          test "$(docker context show)" = default || { echo "DOCKER_CONTEXT_NOT_DEFAULT"; exit 2; }
+          endpoint="$(docker context inspect default --format '{{ .Endpoints.docker.Host }}')"
+          [[ "$endpoint" == unix:///* ]] || { echo "DOCKER_ENDPOINT_NOT_LOCAL"; exit 2; }
+          limits="$(docker info --format '{{.MemoryLimit}} {{.PidsLimit}} {{.CgroupVersion}}')"
+          echo "DOCKER_LIMITS=$limits"
+          [[ "$limits" == "true true 2" ]] || { echo "DOCKER_CGROUP_QUOTAS_UNAVAILABLE"; exit 2; }
+
+      - name: Run generated scratch UID witness, offline and without source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$(mktemp -d)"
+          image="acorn-synthetic-uid-$$:local"
+          cleanup() {
+            docker image rm -f "$image" >/dev/null 2>&1 || true
+            rm -rf "$work"
+          }
+          trap cleanup EXIT
+          mkdir -m 0700 "$work/context"
+          cat > "$work/uid.c" <<'ACORN_UID_WITNESS'
+          #include <stdio.h>
+          #include <unistd.h>
+          int main(void) {
+            if (printf("%lu:%lu:%lu:%lu\n",
+                (unsigned long)getuid(), (unsigned long)getgid(),
+                (unsigned long)geteuid(), (unsigned long)getegid()) < 0) return 3;
+            return fflush(stdout) == 0 ? 0 : 4;
+          }
+          ACORN_UID_WITNESS
+          cc -static -O2 -Wall -Wextra -Werror -o "$work/context/uid-proof" "$work/uid.c"
+          chmod 0555 "$work/context/uid-proof"
+          printf 'FROM scratch\nCOPY uid-proof /uid-proof\nUSER 10001:10001\nENTRYPOINT ["/uid-proof"]\n' > "$work/context/Dockerfile"
+          timeout --signal=TERM --kill-after=5s 45s docker build --pull=false -t "$image" "$work/context"
+          ids="$(timeout --signal=TERM --kill-after=5s 30s docker run --pull=never --rm \
+            --network none --user 10001:10001 --read-only --cap-drop ALL \
+            --cgroupns private --security-opt no-new-privileges=true \
+            --security-opt seccomp=builtin --pids-limit 64 --memory 1g \
+            --memory-swap 1g --cpus 1 "$image")"
+          echo "SYNTHETIC_UID_IDS=$ids"
+          [[ "$ids" == "10001:10001:10001:10001" ]] || { echo "SYNTHETIC_UID_WITNESS_HOLD"; exit 2; }
+          echo "SYNTHETIC_UID_WITNESS_PASS"
+          {
+            echo "## ACORN diagnostic — public hosted runner"
+            echo "- run_sha: ${GITHUB_SHA}"
+            echo "- synthetic_uid_witness: PASS"
+            echo "- chromium_started: false"
+            echo "- private_source_transmitted: false"
+            echo "- network_mode: none (probe container)"
+            echo "- cortex_bound_verified: false"
+            echo "- production_ready: false"
+            echo "- live_verified: false"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Synthetic offline Chromium sandbox witness, no ACORN private code
+        if: github.ref == 'refs/heads/probe/acorn-browser-uid-20261113'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$(mktemp -d)"
+          image="acorn-synthetic-chromium-${GITHUB_RUN_ID}:local"
+          cleanup() {
+            if [[ -f "$work/container.cid" ]]; then
+              cid="$(cat "$work/container.cid" 2>/dev/null || true)"
+              if [[ "$cid" =~ ^[a-f0-9]{12,64}$ ]]; then docker rm -f "$cid" >/dev/null 2>&1 || true; fi
+            fi
+            docker image rm -f "$image" >/dev/null 2>&1 || true
+            rm -rf "$work"
+          }
+          trap cleanup EXIT
+          mkdir -m 0700 "$work/context"
+          cat > "$work/context/Dockerfile" <<'CHROMIUM_DOCKERFILE'
+          FROM mcr.microsoft.com/playwright:v1.65.0-noble
+          WORKDIR /probe
+          RUN printf '{"name":"synthetic-chromium-host-witness","private":true,"type":"module"}\n' > package.json && \
+              npm install --omit=dev --ignore-scripts --no-audit --no-fund --package-lock=false playwright-core@1.65.0
+          COPY --chmod=0644 probe.mjs /probe/probe.mjs
+          COPY --chmod=0644 nested/a.js nested/b.js ./nested/
+          COPY namespace-witness /probe/namespace-witness
+          RUN groupadd --gid 10001 witness && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin witness
+          USER 10001:10001
+          RUN node --check /probe/nested/a.js && node --check /probe/nested/b.js && echo SYNTHETIC_MULTI_COPY_UID10001_PASS
+          ENV NODE_ENV=production HOME=/tmp
+          CMD ["node","/probe/probe.mjs"]
+          CHROMIUM_DOCKERFILE
+          cat > "$work/context/probe.mjs" <<'CHROMIUM_JS'
+          import {chromium} from 'playwright-core';
+          import {readFileSync} from 'node:fs';
+          const uid=process.getuid?.(), gid=process.getgid?.();
+          const status=readFileSync('/proc/self/status','utf8');
+          const val=k=>status.match(new RegExp('^'+k+':\\s*([^\\n]+)','m'))?.[1]?.trim();
+          if(uid!==10001||gid!==10001)throw Error('NON_ROOT_IDENTITY_HOLD');
+          if(val('CapEff')!=='0000000000000000'||val('NoNewPrivs')!=='1'||val('Seccomp')!=='2')
+            throw Error('LOCAL_GUARDS_HOLD');
+          // Read-only cgroup observations; do not raise quotas or remove sandbox guards.
+          const snapshot=(label)=>{
+            const paths={
+              pids_current:'/sys/fs/cgroup/pids.current',
+              pids_max:'/sys/fs/cgroup/pids.max',
+              pids_events:'/sys/fs/cgroup/pids.events',
+              memory_current:'/sys/fs/cgroup/memory.current',
+              memory_events:'/sys/fs/cgroup/memory.events'
+            };
+            const stats={};
+            for(const [name,path] of Object.entries(paths)){
+              try{stats[name]=readFileSync(path,'utf8').trim()}catch{stats[name]='UNAVAILABLE'}
+            }
+            console.log(label+' '+JSON.stringify(stats));
+          };
+          snapshot('CHROMIUM_CGROUP_BEFORE_LAUNCH');
+          const browser=await chromium.launch({headless:true,chromiumSandbox:true,timeout:15000});
+          snapshot('CHROMIUM_CGROUP_AFTER_LAUNCH');
+          try{
+            const context=await browser.newContext({serviceWorkers:'block',acceptDownloads:false,ignoreHTTPSErrors:false});
+            try{
+              if(typeof context.routeWebSocket!=='function')throw Error('NO_WEBSOCKET_BLOCK');
+              await context.route('**/*', async route=>route.abort());
+              await context.routeWebSocket('**/*', async ws=>ws.close());
+              snapshot('CHROMIUM_CGROUP_BEFORE_PAGE');
+              let page;
+              try{page=await context.newPage();}
+              catch(error){
+                snapshot('CHROMIUM_CGROUP_PAGE_FAILED');
+                console.error('CHROMIUM_PAGE_ERROR='+String(error?.message??error).slice(0,700));
+                throw error;
+              }
+              snapshot('CHROMIUM_CGROUP_AFTER_PAGE');
+              await page.goto('about:blank',{timeout:5000});
+              if(page.url()!=='about:blank')throw Error('INCONSISTENT_PAGE');
+              console.log('SYNTHETIC_CHROMIUM_SANDBOX_PASS');
+            }finally{await context.close();}
+          }finally{await browser.close();}
+          CHROMIUM_JS
+          # Simulate the ACORN allowlist: a private 0700 source directory with 0600 JS files.
+          mkdir -m 0700 "$work/context/nested"
+          printf 'export const a=1;\n' > "$work/context/nested/a.js"
+          printf 'export const b=2;\n' > "$work/context/nested/b.js"
+          [[ "$(stat -c '%a' "$work/context/nested")" == "700" ]]
+          [[ "$(stat -c '%a' "$work/context/nested/a.js")" == "600" ]]
+          [[ "$(stat -c '%a' "$work/context/nested/b.js")" == "600" ]]
+          # Prove strict host umask and fix only image permissions via Docker COPY --chmod.
+          source_mode="$(stat -c '%a' "$work/context/probe.mjs")"
+          echo "SYNTHETIC_HOST_SCRIPT_MODE=$source_mode"
+          [[ "$source_mode" == "600" ]] || { echo "HOST_MODE_NOT_PRIVATE"; exit 2; }
+          # Synthetic syscall diagnostic; it never changes host settings or grants capabilities.
+          cat > "$work/namespace-witness.c" <<'ACORN_NAMESPACE_WITNESS'
+          #define _GNU_SOURCE
+          #include <sched.h>
+          #include <unistd.h>
+          #include <errno.h>
+          #include <stdio.h>
+          #include <string.h>
+          int main(void) {
+            printf("SYSCALL_START_UID=%lu GID=%lu\n",
+              (unsigned long)getuid(), (unsigned long)getgid());
+            errno=0;
+            int r=unshare(CLONE_NEWUSER);
+            int e=(r==0?0:errno);
+            printf("SYSCALL_USERNS_RC=%d ERRNO=%d NAME=%s\n",r,e,strerror(e));
+            if (r!=0) { fflush(stdout); return 0; }
+            errno=0;
+            int cr=chroot("/proc/self/fdinfo/");
+            int ce=(cr==0?0:errno);
+            printf("SYSCALL_CHROOT_RC=%d ERRNO=%d NAME=%s\n",cr,ce,strerror(ce));
+            fflush(stdout);
+            return 0;
+          }
+          ACORN_NAMESPACE_WITNESS
+          cc -static -O2 -Wall -Wextra -Werror -o "$work/context/namespace-witness" "$work/namespace-witness.c"
+          chmod 0555 "$work/context/namespace-witness"
+          rm -f -- "$work/namespace-witness.c"
+          timeout --signal=TERM --kill-after=5s 180s docker build --pull \
+            -t "$image" "$work/context"
+          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 35 \
+            --output "$work/seccomp_profile.json" \
+            https://raw.githubusercontent.com/microsoft/playwright/v1.65.0/utils/docker/seccomp_profile.json
+          # Official Playwright v1.65.0 seccomp profile; verify Git blob before trusting.
+          [[ "$(git hash-object "$work/seccomp_profile.json")" == "fddc05fb520affb145404e6f6f647ca96af8087d" ]] || { echo "SECCOMP_PROFILE_UNVERIFIED"; exit 2; }
+          python3 -m json.tool "$work/seccomp_profile.json" > /dev/null
+          echo "SECCOMP_PLAYWRIGHT_PROFILE_VERIFIED"
+          # EXPERIMENTAL_DIAGNOSTIC_ONLY: narrow seccomp syscall change, NOT production approval.
+          # chroot still requires kernel CAP_SYS_CHROOT; parent container has CapEff=0.
+          python3 - "$work/seccomp_profile.json" "$work/experimental-chroot.json" <<'ACORN_SECCOMP_EXPERIMENT'
+          import json,sys
+          source,destination=sys.argv[1:]
+          with open(source,encoding='utf-8') as handle: profile=json.load(handle)
+          assert profile['defaultAction']=='SCMP_ACT_ERRNO'
+          rules=[item for item in profile['syscalls'] if 'chroot' in item.get('names',[])]
+          assert len(rules)==1
+          assert rules[0]['names']==['chroot']
+          assert rules[0]['action']=='SCMP_ACT_ALLOW'
+          assert rules[0].get('includes')=={'caps':['CAP_SYS_CHROOT']}
+          assert rules[0].get('excludes')=={}
+          rules[0]['includes']={}
+          with open(destination,'w',encoding='utf-8') as handle: json.dump(profile,handle,sort_keys=True)
+          print('EXPERIMENTAL_CHROOT_RULE_ONLY; cap-drop ALL preserved; no production authorization')
+          ACORN_SECCOMP_EXPERIMENT
+          chmod 0600 "$work/experimental-chroot.json"
+          # Match Chromium's sandbox exactly, without disabling seccomp or adding caps.
+          timeout --signal=TERM --kill-after=5s 25s docker run --pull=never --rm --init \
+            --network none --user 10001:10001 --read-only --cap-drop ALL \
+            --cgroupns private --security-opt no-new-privileges=true \
+            --security-opt "seccomp=$work/experimental-chroot.json" --pids-limit 64 --memory 1g \
+            --memory-swap 1g --cpus 1 --shm-size 256m --ipc private \
+            --tmpfs /tmp:rw,nosuid,nodev,size=512m,mode=1777 \
+            --entrypoint /probe/namespace-witness "$image"
+          echo "SYSCALL_DIAGNOSTIC_RECORDED_NO_PRIVILEGE_CHANGES"
+          timeout --signal=TERM --kill-after=5s 70s docker run --pull=never --rm --init \
+            --cidfile "$work/container.cid" \
+            --network none --user 10001:10001 --read-only --cap-drop ALL \
+            --cgroupns private --security-opt no-new-privileges=true \
+            --security-opt "seccomp=$work/experimental-chroot.json" --pids-limit 128 --memory 1g \
+            --memory-swap 1g --cpus 1 --shm-size 256m --ipc private \
+            --tmpfs /tmp:rw,nosuid,nodev,size=512m,mode=1777 \
+            --tmpfs /run/acorn-browser/private:rw,nosuid,nodev,noexec,size=64m,mode=0700,uid=10001,gid=10001 \
+            "$image"
+          {
+            echo "## ACORN public runner — synthetic Chromium (not canonical)"
+            echo "- run_sha: ${GITHUB_SHA}"
+            echo "- synthetic_chromium_sandbox: PASS"
+            echo "- private_acorn_source_included: false"
+            echo "- google_login: false"
+            echo "- cortex_bound_verified: false"
+            echo "- production_ready: false"
+            echo "- live_verified: false"
+          } >> "$GITHUB_STEP_SUMMARY"
